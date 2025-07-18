@@ -415,15 +415,15 @@ def run_strategy_disk(files: List[Path], id_to_file_map: Dict[int, str], config:
     """
     'disk' stratégia végrehajtása. Nagyon nagy adatmennyiséghez, külső rendezést (external sort) használ.
     1. Fázis: Minden fájlt darabokban feldolgoz, és a hash-eket rendezve ideiglenes fájlokba írja.
-    2. Fázis: Az összes ideiglenes fájlt összefésüli (merge), és közben keresi a duplikátumokat.
+    2. Fázis: Lépcsőzetes összefésülés (cascading merge) a "túl sok nyitott fájl" hiba elkerülésére.
+    3. Fázis: A végső, rendezett fájl feldolgozása a duplikátumok azonosítására.
     """
     logger.info("--- Indítás: DISK (optimalizált diszk-alapú) stratégia ---")
-    # Ideiglenes könyvtár előkészítése
     if TEMP_DIR.exists():
         for f in TEMP_DIR.iterdir(): f.unlink()
     TEMP_DIR.mkdir(exist_ok=True)
 
-    temp_files = []
+    all_temp_files = []
     try:
         # --- 1. FÁZIS: Adatok feldolgozása és rendezett ideiglenes fájlokba írása ---
         logger.info("--- 1. FÁZIS: Adatok feldolgozása és rendezett ideiglenes fájlokba írása (darabolva) ---")
@@ -435,46 +435,79 @@ def run_strategy_disk(files: List[Path], id_to_file_map: Dict[int, str], config:
                 task_path, task_id = future_to_task[future][0], future_to_task[future][1]
                 try:
                     chunk_files = future.result()
-                    temp_files.extend(chunk_files)
+                    all_temp_files.extend(chunk_files)
                     file_only_logger.info(f"[1. fázis] Feldolgozva: {id_to_file_map[task_id]}")
                 except Exception as e:
                     logger.error(f"Hiba a(z) '{task_path.name}' (ID: {task_id}) feldolgozása során: {e}", exc_info=True)
 
-        # --- 2. FÁZIS: Rendezett fájlok összefésülése és duplikátumok keresése ---
-        logger.info("--- 2. FÁZIS: Rendezett fájlok összefésülése és duplikátumok keresése ---")
-        output_data = {}
+        # --- 2. FÁZIS: Lépcsőzetes összefésülés (Cascading Merge) ---
+        logger.info("--- 2. FÁZIS: Lépcsőzetes összefésülés (Cascading Merge) ---")
         
-        # Az összes ideiglenes fájl megnyitása olvasásra
-        open_files = [f.open('r', encoding='utf-8') for f in temp_files]
-        # A heapq.merge hatékonyan összefésüli a már rendezett iterátorokat (fájlokat)
-        merged_lines = heapq.merge(*open_files)
-        # Az összefésült sorokat hash szerint csoportosítjuk
-        line_grouper = itertools.groupby(merged_lines, key=lambda line: line.split(DISK_MODE_DELIMITER, 1)[0])
-
-        for h, group in tqdm(line_grouper, desc="DISK 2. fázis - Összefésülés"):
-            group_items = list(group)
-            # Ha egy csoportban több mint egy elem van, az duplikátum
-            if len(group_items) > 1:
-                file_ids, prefix = set(), ""
-                for item in group_items:
-                    try:
-                        _, fid_str, current_prefix = item.strip().split(DISK_MODE_DELIMITER, 2)
-                        file_ids.add(int(fid_str))
-                        if not prefix: prefix = current_prefix
-                    except ValueError: continue
+        def merge_files(files_to_merge: List[Path], output_path: Path):
+            """Segédfüggvény, amely összefésül egy listányi fájlt egyetlen kimeneti fájlba."""
+            open_files_list = []
+            try:
+                for f in files_to_merge:
+                    open_files_list.append(f.open('r', encoding='utf-8'))
                 
-                if prefix:
-                    output_data[prefix] = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+                with output_path.open('w', encoding='utf-8') as f_out:
+                    merged_lines = heapq.merge(*open_files_list)
+                    f_out.writelines(merged_lines)
+            finally:
+                for f in open_files_list:
+                    f.close()
 
-        for f in open_files: f.close()
+        merge_level = 0
+        temp_files_for_merge = all_temp_files.copy() # Másolatot használunk, hogy az eredeti lista megmaradjon a takarításhoz
+        while len(temp_files_for_merge) > 1:
+            merge_level += 1
+            logger.info(f"Összefésülési szint {merge_level}, {len(temp_files_for_merge)} fájl feldolgozása...")
+            merged_level_files = []
+            
+            for i in tqdm(range(0, len(temp_files_for_merge), config['merge_batch_size']), desc=f"Összefésülés szint {merge_level}"):
+                batch = temp_files_for_merge[i:i + config['merge_batch_size']]
+                if not batch: continue
+                
+                output_path = TEMP_DIR / f"merged_{merge_level}_{i}.tmp"
+                merge_files(batch, output_path)
+                merged_level_files.append(output_path)
+                all_temp_files.append(output_path) # Hozzáadjuk a takarítandó fájlok listájához
+
+            temp_files_for_merge = merged_level_files
+
+        final_merged_file = temp_files_for_merge[0] if temp_files_for_merge else None
+
+        # --- 3. FÁZIS: Duplikátumok keresése a végső összefésült fájlban ---
+        logger.info("--- 3. FÁZIS: Duplikátumok keresése a végső összefésült fájlban ---")
+        output_data = {}
+        if final_merged_file and final_merged_file.exists():
+            with final_merged_file.open('r', encoding='utf-8') as f:
+                line_grouper = itertools.groupby(f, key=lambda line: line.split(DISK_MODE_DELIMITER, 1)[0])
+                for h, group in tqdm(line_grouper, desc="DISK 3. fázis - Duplikátumkeresés"):
+                    group_items = list(group)
+                    if len(group_items) > 1:
+                        file_ids, prefix = set(), ""
+                        for item in group_items:
+                            try:
+                                _, fid_str, current_prefix = item.strip().split(DISK_MODE_DELIMITER, 2)
+                                file_ids.add(int(fid_str))
+                                if not prefix: prefix = current_prefix
+                            except (ValueError, IndexError): continue
+                        
+                        if prefix:
+                            output_data[prefix] = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+        
         write_duplicates(output_data, DEFAULT_OUTPUT_FILE, logger)
 
     finally:
-        # Az ideiglenes fájlok és a könyvtár törlése a futás végén
         logger.info("Ideiglenes fájlok törlése...")
         try:
-            for f in TEMP_DIR.iterdir(): f.unlink()
-            TEMP_DIR.rmdir()
+            # A finally blokkban a all_temp_files listában szereplő összes fájlt töröljük
+            for f in all_temp_files:
+                if f.exists():
+                    f.unlink()
+            if TEMP_DIR.exists():
+                TEMP_DIR.rmdir()
         except Exception as e:
             logger.warning(f"Nem sikerült minden ideiglenes fájlt törölni: {e}")
 
@@ -588,6 +621,10 @@ def main():
     parser.add_argument(
         '-fp', '--file-pattern', type=str, default='*.csv',
         help="Fájl minta a bemeneti fájlok szűréséhez (pl. '*_2024_*.csv')."
+    )
+    parser.add_argument(
+        '-mbs', '--merge-batch-size', type=int, default=256,
+        help="Hány ideiglenes fájlt fésüljön össze egyszerre a 'disk' módban (alapértelmezett: 256)."
     )
     args = parser.parse_args()  # Argumentumok beolvasása
     config = vars(args)  # Argumentumok szótárrá alakítása a könnyebb átadhatóságért
