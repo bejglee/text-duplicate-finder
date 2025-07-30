@@ -102,6 +102,11 @@ python duplicates.py --file-pattern "*_2024_*.csv"
 python duplicates.py --hash-fields 4
 ```
 
+#### Delete duplicates from files:
+```bash
+python duplicates.py -dd true
+```
+
 ## How It Works
 
 1. **File Discovery**: Scans the input directory for files matching the specified pattern
