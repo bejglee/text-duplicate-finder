@@ -73,6 +73,7 @@ python duplicates.py [options]
 - `-hf, --hash-fields`: Number of fields to use for hashing (default: 6)
 - `-hd, --hash-delimiter`: Field delimiter character (default: `;`)
 - `-fp, --file-pattern`: File pattern for filtering (default: `*.csv`)
+- `-dd, --deleteduplicates`: true or false. If true, deletes duplicate lines (both intra-file and inter-file) from the source files.
 
 ### Examples
 
