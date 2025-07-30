@@ -4,7 +4,7 @@
 # Párhuzamos duplikátumkereső szkript, amely a beküldött kódok legjobb
 # tulajdonságait egyesíti a maximális sebesség, memóriahatékonyság és
 # robusztusság érdekében.
-# VERZIÓ: 2.0 (Refaktorált)
+# VERZIÓ: 2.2 (Fájlon belüli és fájlok közötti duplikátumtörlés funkcióval kibővítve)
 
 # ==============================================================================
 # HASZNÁLATI ÚTMUTATÓ (PARANCSSORI ARGUMENTUMOK)
@@ -53,6 +53,9 @@
 # 6. Hash-eléshez használt mezők számának módosítása:
 #    python find_duplicates.py --hash-fields 4
 #
+# 7. Duplikátumok törlése a fájlokból (fájlon belüli és fájlok közötti):
+#    python find_duplicates.py --deleteduplicates true
+#
 # ==============================================================================
 
 # --- Szükséges modulok importálása ---
@@ -64,6 +67,8 @@ import heapq  # Kupac (heap) algoritmusok, a 'disk' módhoz szükséges
 import logging  # Naplózási funkciók
 import argparse  # Parancssori argumentumok feldolgozása
 import itertools  # Iterátorokat létrehozó függvények (pl. csoportosítás)
+import shutil  # Fájlműveletek (másolás, mozgatás)
+import tempfile  # Ideiglenes fájlok kezelése
 from tqdm import tqdm  # Haladást jelző sáv (progress bar)
 from pathlib import Path  # Objektumorientált fájlrendszer-elérési utak
 from datetime import datetime  # Dátum és idő kezelése
@@ -211,6 +216,325 @@ def write_duplicates(duplicates_data: Dict[str, List[str]], output_file: Path, l
     except IOError as e:
         logger.error(f"Hiba a kimeneti fájl írása közben: {e}")
 
+# --- ÚJ FÁJLON BELÜLI DUPLIKÁTUMTÖRLÉSI FUNKCIÓK ---
+
+def find_and_delete_intrafile_duplicates(file_path: Path, config: Dict[str, Any], logger: logging.Logger) -> int:
+    """
+    Megkeresi és törli a fájlon belüli duplikátumokat. Minden hash-hez csak az első előfordulást hagyja meg.
+    Visszaadja a törölt sorok számát.
+    """
+    # logger.info(f"Fájlon belüli duplikátumok keresése és törlése: {file_path.name}")
+    
+    try:
+        seen_hashes = set()
+        lines_to_keep = []
+        deleted_count = 0
+        
+        # Fájl beolvasása és duplikátumok szűrése
+        with file_path.open('r', encoding='utf-8', errors='ignore') as f:
+            # Fejléc megtartása
+            header = next(f, None)
+            if header:
+                lines_to_keep.append(header)
+            
+            # Sorok feldolgozása
+            for line in f:
+                stripped_line = line.strip()
+                if not stripped_line:
+                    lines_to_keep.append(line)  # Üres sorok megtartása
+                    continue
+                
+                # Hash számítása
+                normalized = normalize_line(stripped_line, config['hash_delimiter'], config['hash_fields'])
+                line_hash = hash_normalized_line(normalized)
+                
+                # Első előfordulás megtartása, duplikátumok törlése
+                if line_hash not in seen_hashes:
+                    seen_hashes.add(line_hash)
+                    lines_to_keep.append(line)
+                else:
+                    deleted_count += 1
+        
+        # Ha vannak törölendő sorok, fájl frissítése
+        if deleted_count > 0:
+            # Biztonsági mentés készítése
+            backup_path = file_path.with_suffix(file_path.suffix + '.backup')
+            shutil.copy2(file_path, backup_path)
+            
+            # Szűrt tartalom visszaírása
+            with file_path.open('w', encoding='utf-8') as f:
+                f.writelines(lines_to_keep)
+            
+            # Biztonsági mentés törlése (opcionális)
+            backup_path.unlink()
+            
+            #logger.info(f"Fájlon belüli duplikátumtörlés: {deleted_count} sor törölve a(z) '{file_path.name}' fájlból.")
+        #else:
+            #logger.info(f"Nincs fájlon belüli duplikátum a(z) '{file_path.name}' fájlban.")
+        
+        return deleted_count
+        
+    except Exception as e:
+        logger.error(f"Hiba a fájlon belüli duplikátumtörlés során a(z) '{file_path.name}' fájlban: {e}")
+        return 0
+
+def count_intrafile_duplicates(file_path: Path, config: Dict[str, Any]) -> int:
+    """
+    Megszámolja egy fájlon belül a duplikált sorokat duplikátumtörlés nélkül.
+    Visszaadja a duplikált sorok számát (az első előfordulás kivételével).
+    """
+    try:
+        seen_hashes = set()
+        duplicate_count = 0
+        
+        with file_path.open('r', encoding='utf-8', errors='ignore') as f:
+            next(f, None)  # Fejléc átugrása
+            for line in f:
+                stripped_line = line.strip()
+                if not stripped_line:
+                    continue
+                
+                # Hash számítása
+                normalized = normalize_line(stripped_line, config['hash_delimiter'], config['hash_fields'])
+                line_hash = hash_normalized_line(normalized)
+                
+                # Duplikátumok számlálása
+                if line_hash in seen_hashes:
+                    duplicate_count += 1
+                else:
+                    seen_hashes.add(line_hash)
+        
+        return duplicate_count
+        
+    except Exception as e:
+        return 0
+
+# --- FRISSÍTETT DUPLIKÁTUMTÖRLÉSI FUNKCIÓK ---
+
+def collect_duplicate_lines_for_deletion(files: List[Path], duplicates_data: Dict[str, List[str]], config: Dict[str, Any], logger: logging.Logger) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Összegyűjti a törlendő duplikált sorokat minden fájlból (csak fájlok közötti duplikátumokhoz).
+    Visszaad egy szótárat: {hash: {filename: [matching_lines]}}
+    """
+    logger.info("--- DUPLIKÁTUMTÖRLÉS: Fájlok közötti törlendő sorok összegyűjtése ---")
+    
+    # Csak a fájlok közötti duplikátumokat vesszük figyelembe (több fájlban előforduló prefixek)
+    inter_file_duplicate_prefixes = {prefix for prefix, file_list in duplicates_data.items() if len(file_list) > 1}
+    
+    if not inter_file_duplicate_prefixes:
+        logger.info("Nincsenek fájlok közötti duplikátumok.")
+        return {}
+    
+    # Hash -> teljes sor mapping létrehozása
+    prefix_to_hash = {}
+    hash_to_files = defaultdict(set)
+    
+    # Minden fájl átnézése a duplikált sorok megkeresésére
+    for file_path in tqdm(files, desc="Fájlok közötti duplikált sorok keresése"):
+        try:
+            with file_path.open('r', encoding='utf-8', errors='ignore') as f:
+                header = next(f, None)  # Fejléc mentése
+                for line in f:
+                    stripped_line = line.strip()
+                    if not stripped_line:
+                        continue
+                    
+                    # Prefix létrehozása
+                    prefix = stripped_line[:config['write_length']]
+                    
+                    # Ha ez a prefix fájlok közötti duplikátum
+                    if prefix in inter_file_duplicate_prefixes:
+                        # Hash számítása
+                        normalized = normalize_line(stripped_line, config['hash_delimiter'], config['hash_fields'])
+                        line_hash = hash_normalized_line(normalized)
+                        
+                        # Hash -> prefix mapping
+                        if line_hash not in prefix_to_hash:
+                            prefix_to_hash[line_hash] = prefix
+                        
+                        # Hash -> fájlok mapping
+                        hash_to_files[line_hash].add(file_path.name)
+                        
+        except Exception as e:
+            logger.error(f"Hiba a fájlok közötti duplikált sorok keresése közben a(z) '{file_path.name}' fájlban: {e}")
+    
+    # Csak azok a hash-ek érdekesek, amelyek több fájlban is előfordulnak
+    multi_file_duplicates = {h: files for h, files in hash_to_files.items() if len(files) > 1}
+    
+    logger.info(f"Összesen {len(multi_file_duplicates)} hash található több fájlban is.")
+    
+    # Most összegyűjtjük a tényleges sorokat minden hash-hez
+    lines_to_delete = defaultdict(lambda: defaultdict(list))
+    
+    for file_path in tqdm(files, desc="Fájlok közötti törlendő sorok részletes összegyűjtése"):
+        try:
+            with file_path.open('r', encoding='utf-8', errors='ignore') as f:
+                header = next(f, None)
+                for line in f:
+                    stripped_line = line.strip()
+                    if not stripped_line:
+                        continue
+                    
+                    # Hash számítása
+                    normalized = normalize_line(stripped_line, config['hash_delimiter'], config['hash_fields'])
+                    line_hash = hash_normalized_line(normalized)
+                    
+                    # Ha ez a hash multi-file duplikátum
+                    if line_hash in multi_file_duplicates:
+                        lines_to_delete[line_hash][file_path.name].append(stripped_line)
+                        
+        except Exception as e:
+            logger.error(f"Hiba a fájlok közötti törlendő sorok részletes összegyűjtése közben a(z) '{file_path.name}' fájlban: {e}")
+    
+    return lines_to_delete
+
+def delete_duplicate_rows(files: List[Path], lines_to_delete: Dict[str, Dict[str, List[str]]], duplicates_data: Dict[str, List[str]], config: Dict[str, Any], logger: logging.Logger) -> Dict[str, List[str]]:
+    """
+    Törli a duplikált sorokat a fájlokból. Minden hash esetében az első fájlban hagyja meg az első előfordulást,
+    a többi fájlból törli az összes előfordulást.
+    Ezután kezeli a fájlon belüli duplikátumokat is.
+    """
+    logger.info("--- DUPLIKÁTUMTÖRLÉS: Duplikált sorok törlése a fájlokból ---")
+    
+    modified_duplicates_data = duplicates_data.copy()
+    inter_file_deleted_counts = defaultdict(int)
+    intra_file_deleted_counts = defaultdict(int)
+    
+    # 1. FÁJLOK KÖZÖTTI DUPLIKÁTUMOK TÖRLÉSE
+    logger.info("1. Fájlok közötti duplikátumok törlése...")
+    
+    # Minden hash esetében meghatározzuk, hogy melyik fájlban hagyjuk meg az első előfordulást
+    for line_hash, file_lines_map in lines_to_delete.items():
+        if not file_lines_map:
+            continue
+            
+        # Fájlok sorba rendezése (első fájl = megmarad, többi = törlés)
+        sorted_files = sorted(file_lines_map.keys())
+        keep_file = sorted_files[0]  # Az első fájlban hagyjuk meg
+        delete_files = sorted_files[1:]  # A többi fájlból töröljük
+        
+        logger.info(f"Hash {line_hash[:8]}...: megtartás -> {keep_file}, törlés -> {delete_files}")
+        
+        # Törlés végrehajtása
+        for delete_file in delete_files:
+            file_path = None
+            for f in files:
+                if f.name == delete_file:
+                    file_path = f
+                    break
+            
+            if not file_path:
+                logger.warning(f"Nem található fájl: {delete_file}")
+                continue
+                
+            lines_to_remove = file_lines_map[delete_file]
+            if delete_rows_from_file(file_path, lines_to_remove, logger):
+                inter_file_deleted_counts[delete_file] += len(lines_to_remove)
+    
+    # 2. FÁJLON BELÜLI DUPLIKÁTUMOK TÖRLÉSE
+    logger.info("2. Fájlon belüli duplikátumok törlése...")
+    
+    for file_path in tqdm(files, desc="Fájlon belüli duplikátumtörlés"):
+        intra_deleted = find_and_delete_intrafile_duplicates(file_path, config, logger)
+        if intra_deleted > 0:
+            intra_file_deleted_counts[file_path.name] = intra_deleted
+    
+    # 3. KIMENETI ADATOK FRISSÍTÉSE
+    # Fájlok közötti duplikátumok frissítése
+    for prefix, file_list in list(modified_duplicates_data.items()):
+        if len(file_list) > 1:  # Fájlok közötti duplikátum
+            updated_file_list = []
+            for filename in file_list:
+                if inter_file_deleted_counts[filename] > 0:
+                    updated_file_list.append(f"{filename} -> Törölve {inter_file_deleted_counts[filename]} sor")
+                else:
+                    updated_file_list.append(filename)
+            modified_duplicates_data[prefix] = updated_file_list
+        else:  # Fájlon belüli duplikátum - frissítjük a meglévő bejegyzést
+            filename = file_list[0]
+            if intra_file_deleted_counts[filename] > 0:
+                modified_duplicates_data[prefix] = [f"{filename} -> Törölve {intra_file_deleted_counts[filename]} sor"]
+    
+    # 4. ÚJ FÁJLON BELÜLI DUPLIKÁTUMOK HOZZÁADÁSA (csak azok, amelyek még nem szerepelnek)
+    # Azok a fájlok, amelyeknek van fájlon belüli duplikátuma, de még nem szerepelnek a kimenetben
+    for filename, deleted_count in intra_file_deleted_counts.items():
+        if deleted_count > 0:
+            # Ellenőrizzük, hogy ez a fájl már szerepel-e valamelyik duplikátumban
+            already_listed = False
+            for file_list in modified_duplicates_data.values():
+                for listed_file in file_list:
+                    # Eltávolítjuk a " -> Törölve X sor" részt az összehasonlításhoz
+                    clean_filename = listed_file.split(' ->')[0]
+                    if clean_filename == filename:
+                        already_listed = True
+                        break
+                if already_listed:
+                    break
+            
+            # Ha még nem szerepel, akkor hozzáadjuk
+            if not already_listed:
+                # Dummy prefix a fájlon belüli duplikátumokhoz
+                dummy_prefix = f"(Csak fájlon belüli duplikátumok - {filename})"
+                modified_duplicates_data[dummy_prefix] = [f"{filename} -> Törölve {deleted_count} sor"]
+    
+    # Összegzés naplózása
+    total_inter_deleted = sum(inter_file_deleted_counts.values())
+    total_intra_deleted = sum(intra_file_deleted_counts.values())
+    total_deleted = total_inter_deleted + total_intra_deleted
+    
+    logger.info(f"Duplikátumtörlés befejezve.")
+    logger.info(f"Fájlok közötti duplikátumok: {total_inter_deleted} sor törölve {len(inter_file_deleted_counts)} fájlból.")
+    logger.info(f"Fájlon belüli duplikátumok: {total_intra_deleted} sor törölve {len(intra_file_deleted_counts)} fájlból.")
+    logger.info(f"Összesen: {total_deleted} sor törölve.")
+    
+    return modified_duplicates_data
+
+def delete_rows_from_file(file_path: Path, lines_to_remove: List[str], logger: logging.Logger) -> bool:
+    """
+    Biztonságosan törli a megadott sorokat egy fájlból.
+    Ideiglenes fájlt használ a biztonságos módosításhoz.
+    """
+    try:
+        # Set létrehozása a gyors kereséshez
+        lines_to_remove_set = set(lines_to_remove)
+        
+        # Ideiglenes fájl létrehozása
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, suffix='.tmp') as temp_file:
+            temp_path = Path(temp_file.name)
+            
+            # Eredeti fájl olvasása és szűrt tartalom írása
+            with file_path.open('r', encoding='utf-8', errors='ignore') as original_file:
+                # Fejléc megtartása
+                header = next(original_file, None)
+                if header:
+                    temp_file.write(header)
+                
+                # Sorok szűrése
+                for line in original_file:
+                    stripped_line = line.strip()
+                    if stripped_line not in lines_to_remove_set:
+                        temp_file.write(line)
+        
+        # Eredeti fájl biztonsági mentése
+        backup_path = file_path.with_suffix(file_path.suffix + '.backup')
+        shutil.copy2(file_path, backup_path)
+        
+        # Ideiglenes fájl áthelyezése az eredeti helyre
+        shutil.move(str(temp_path), str(file_path))
+        
+        # Biztonsági mentés törlése (opcionális, megjegyzésbe tehető)
+        backup_path.unlink()
+        
+        logger.info(f"Sikeresen törölve {len(lines_to_remove)} sor a(z) '{file_path.name}' fájlból.")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Hiba a sorok törlése közben a(z) '{file_path.name}' fájlban: {e}")
+        # Takarítás hiba esetén
+        if 'temp_path' in locals() and temp_path.exists():
+            temp_path.unlink()
+        return False
+
 # --- Worker Függvények ---
 
 def process_file_fast(file_path: Path, file_id: int, config: Dict[str, Any]) -> Dict[str, Tuple[str, int]]:
@@ -319,7 +643,8 @@ def process_and_sort_chunk_disk(file_info: Tuple[Path, int, Path, Dict[str, Any]
 
     return chunk_files
 
-# --- Stratégia Vezérlő Függvények ---
+# --- FRISSÍTETT Stratégia Vezérlő Függvények ---
+
 def run_strategy_fast(files: List[Path], id_to_file_map: Dict[int, str], config: Dict[str, Any], logger: logging.Logger, file_only_logger: logging.Logger):
     """
     'fast' stratégia végrehajtása.
@@ -349,11 +674,28 @@ def run_strategy_fast(files: List[Path], id_to_file_map: Dict[int, str], config:
 
     # Kimeneti adatok előkészítése a duplikátumokból
     output_data = {}
+    intra_file_duplicates = {}
+    
     for _, (prefix, file_counts) in global_hashes.items():
-        # Akkor duplikátum, ha az összes előfordulás száma > 1
-        if sum(file_counts.values()) > 1:
+        total_occurrences = sum(file_counts.values())
+        
+        # Fájlok közötti duplikátumok (több fájlban előfordul)
+        if len(file_counts) > 1:
             file_ids = file_counts.keys()
             output_data[prefix] = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+        # Fájlon belüli duplikátumok (egy fájlban, de többször)
+        elif total_occurrences > 1:
+            file_id = list(file_counts.keys())[0]
+            filename = id_to_file_map[file_id]
+            intra_file_duplicates[prefix] = [filename]
+
+    # Fájlon belüli duplikátumok hozzáadása a kimenethez
+    output_data.update(intra_file_duplicates)
+
+    # Duplikátumtörlés végrehajtása, ha engedélyezve van
+    if config.get('deleteduplicates', False):
+        lines_to_delete = collect_duplicate_lines_for_deletion(files, output_data, config, logger)
+        output_data = delete_duplicate_rows(files, lines_to_delete, output_data, config, logger)
 
     # Duplikátumok kiírása fájlba
     write_duplicates(output_data, DEFAULT_OUTPUT_FILE, logger)
@@ -382,8 +724,14 @@ def run_strategy_safe(files: List[Path], id_to_file_map: Dict[int, str], config:
             except Exception as e:
                 logger.error(f"Hiba (1. fázis) a(z) '{id_to_file_map[file_id]}' feldolgozása során: {e}", exc_info=True)
 
-    # Azon hash-ek kiválasztása, amelyek több mint egyszer fordulnak elő összesen
-    duplicate_hashes = {h for h, fc in hash_to_file_counts.items() if sum(fc.values()) > 1}
+    # Azon hash-ek kiválasztása, amelyek duplikátumok (fájlok között vagy fájlon belül)
+    duplicate_hashes = set()
+    for h, fc in hash_to_file_counts.items():
+        total_count = sum(fc.values())
+        file_count = len(fc)
+        # Duplikátum, ha több fájlban előfordul VAGY egy fájlban többször
+        if file_count > 1 or total_count > 1:
+            duplicate_hashes.add(h)
     
     if not duplicate_hashes:
         write_duplicates({}, DEFAULT_OUTPUT_FILE, logger)
@@ -406,8 +754,23 @@ def run_strategy_safe(files: List[Path], id_to_file_map: Dict[int, str], config:
     output_data = {}
     for h, prefix in hash_to_prefix_map.items():
         if h in duplicate_hashes:
-            file_ids = hash_to_file_counts[h].keys()
-            output_data[prefix] = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+            file_counts = hash_to_file_counts[h]
+            total_count = sum(file_counts.values())
+            file_count = len(file_counts)
+            
+            # Fájlok közötti duplikátum
+            if file_count > 1:
+                file_ids = file_counts.keys()
+                output_data[prefix] = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+            # Fájlon belüli duplikátum
+            elif total_count > 1:
+                file_id = list(file_counts.keys())[0]
+                output_data[prefix] = [id_to_file_map[file_id]]
+
+    # Duplikátumtörlés végrehajtása, ha engedélyezve van
+    if config.get('deleteduplicates', False):
+        lines_to_delete = collect_duplicate_lines_for_deletion(files, output_data, config, logger)
+        output_data = delete_duplicate_rows(files, lines_to_delete, output_data, config, logger)
 
     write_duplicates(output_data, DEFAULT_OUTPUT_FILE, logger)
 
@@ -487,6 +850,8 @@ def run_strategy_disk(files: List[Path], id_to_file_map: Dict[int, str], config:
                     group_items = list(group)
                     if len(group_items) > 1:
                         file_ids, prefix = set(), ""
+                        total_occurrences = len(group_items)
+                        
                         for item in group_items:
                             try:
                                 _, fid_str, current_prefix = item.strip().split(DISK_MODE_DELIMITER, 2)
@@ -495,8 +860,14 @@ def run_strategy_disk(files: List[Path], id_to_file_map: Dict[int, str], config:
                             except (ValueError, IndexError): continue
                         
                         if prefix:
-                            output_data[prefix] = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+                            file_names = [id_to_file_map[fid] for fid in sorted(list(file_ids))]
+                            output_data[prefix] = file_names
         
+        # Duplikátumtörlés végrehajtása, ha engedélyezve van
+        if config.get('deleteduplicates', False):
+            lines_to_delete = collect_duplicate_lines_for_deletion(files, output_data, config, logger)
+            output_data = delete_duplicate_rows(files, lines_to_delete, output_data, config, logger)
+
         write_duplicates(output_data, DEFAULT_OUTPUT_FILE, logger)
 
     finally:
@@ -586,6 +957,18 @@ def auto_select_strategy(files: List[Path], wlength: int, logger: logging.Logger
         logger.warning(f"Nem sikerült az automatikus stratégiaválasztás ({e}). Alapértelmezett: 'safe' mód.")
         return "safe"
 
+def str_to_bool(value: str) -> bool:
+    """
+    Konvertál egy string értéket boolean-ná.
+    Elfogadott értékek: 'true', 'false' (kis/nagy betű érzéketlen).
+    """
+    if value.lower() == 'true':
+        return True
+    elif value.lower() == 'false':
+        return False
+    else:
+        raise argparse.ArgumentTypeError(f"Boolean érték várható ('true' vagy 'false'), de '{value}' érkezett.")
+
 def main():
     """
     A program fő belépési pontja.
@@ -594,7 +977,7 @@ def main():
     """
     # Parancssori argumentumok feldolgozójának létrehozása
     parser = argparse.ArgumentParser(
-        description="Párhuzamos duplikátumkereső nagy szöveges fájlokban (Verzió 2.0).",
+        description="Párhuzamos duplikátumkereső nagy szöveges fájlokban (Verzió 2.2 - Fájlon belüli és fájlok közötti duplikátumtörlés funkcióval).",
         formatter_class=argparse.RawTextHelpFormatter
     )
     # Argumentumok hozzáadása
@@ -626,6 +1009,11 @@ def main():
         '-mbs', '--merge-batch-size', type=int, default=256,
         help="Hány ideiglenes fájlt fésüljön össze egyszerre a 'disk' módban (alapértelmezett: 256)."
     )
+    # ÚJ ARGUMENTUM: Duplikátumtörlés engedélyezése
+    parser.add_argument(
+        '-dd', '--deleteduplicates', type=str_to_bool, default=False,
+        help="Duplikált sorok törlése a fájlokból (fájlon belüli és fájlok közötti) (true/false, alapértelmezett: false)."
+    )
     args = parser.parse_args()  # Argumentumok beolvasása
     config = vars(args)  # Argumentumok szótárrá alakítása a könnyebb átadhatóságért
 
@@ -636,6 +1024,13 @@ def main():
     logger.info(f"Program indítása {MAX_WORKERS} worker processzel.")
     logger.info(f"Használt hash algoritmus: {HASH_ALGO_NAME}")
     logger.info(f"Konfiguráció: {config}")
+    
+    # Duplikátumtörlés figyelmeztetés
+    if config.get('deleteduplicates', False):
+        logger.warning("FIGYELEM: A duplikátumtörlés funkció be van kapcsolva!")
+        logger.warning("A duplikált sorok törlésre kerülnek a fájlokból!")
+        logger.warning("Ez magában foglalja a fájlon belüli és a fájlok közötti duplikátumokat is!")
+        logger.warning("Biztonsági mentés készítése ajánlott a feldolgozás előtt!")
 
     # Bemeneti fájlok begyűjtése
     files = get_input_files(args.input, args.file_pattern, logger)
