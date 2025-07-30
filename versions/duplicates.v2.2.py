@@ -216,6 +216,36 @@ def write_duplicates(duplicates_data: Dict[str, List[str]], output_file: Path, l
     except IOError as e:
         logger.error(f"Hiba a kimeneti fájl írása közben: {e}")
 
+# --- ÚJ, Sorszámláló segédfüggvények ---
+def count_lines_worker(file_path: Path) -> int:
+    """Egyetlen fájl sorainak megszámolására szolgáló worker függvény."""
+    try:
+        with file_path.open('r', encoding='utf-8', errors='ignore') as f:
+            return sum(1 for _ in f)
+    except Exception:
+        # Hiba esetén 0-t ad vissza, a hiba naplózása a hívó oldalon történik.
+        return 0
+
+def get_total_line_count(files: List[Path], logger: logging.Logger) -> int:
+    """
+    Párhuzamosan megszámolja a megadott fájlokban lévő összes sort.
+    """
+    total_lines = 0
+    logger.info(f"Összes sorszám számítása {len(files)} fájlban...")
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_file = {executor.submit(count_lines_worker, f): f for f in files}
+        
+        for future in tqdm(as_completed(future_to_file), total=len(files), desc="Sorszámok számítása"):
+            file_path = future_to_file[future]
+            try:
+                line_count = future.result()
+                total_lines += line_count - 1 if line_count > 0 else 0 # Az első sor fejléc, ezért azt nem számoljuk bele
+            except Exception as e:
+                logger.error(f"Hiba a(z) '{file_path.name}' fájl sorszámának számítása közben: {e}")
+                
+    return total_lines
+# --- VÉGE: Sorszámláló segédfüggvények ---
+
 # --- ÚJ FÁJLON BELÜLI DUPLIKÁTUMTÖRLÉSI FUNKCIÓK ---
 
 def find_and_delete_intrafile_duplicates(file_path: Path, config: Dict[str, Any], logger: logging.Logger) -> int:
@@ -1030,12 +1060,16 @@ def main():
         logger.warning("FIGYELEM: A duplikátumtörlés funkció be van kapcsolva!")
         logger.warning("A duplikált sorok törlésre kerülnek a fájlokból!")
         logger.warning("Ez magában foglalja a fájlon belüli és a fájlok közötti duplikátumokat is!")
-        logger.warning("Biztonsági mentés készítése ajánlott a feldolgozás előtt!")
 
     # Bemeneti fájlok begyűjtése
     files = get_input_files(args.input, args.file_pattern, logger)
     if not files:
         return  # Ha nincsenek fájlok, a program leáll
+
+    # --- ÚJ: Kezdeti sorszám számítása ---
+    initial_total_lines = get_total_line_count(files, logger)
+    logger.info(f"A fájlok összesen {initial_total_lines:,} sort tartalmaznak a feldolgozás előtt.")
+    # --- VÉGE: Kezdeti sorszám számítása ---
 
     # Fájlnevek és egyedi azonosítók összerendelése
     id_to_file_map = {i: f.name for i, f in enumerate(files)}
@@ -1057,7 +1091,22 @@ def main():
 
     # gc.collect() # Opcionális szemétgyűjtés a végén
     end_time = time.time()  # Futási idő mérésének leállítása
+    
+    # --- ÚJ: Végső statisztikák kiírása ---
+    logger.info("=" * 50)
+    logger.info("--- VÉGSŐ ÖSSZEGZÉS ---")
     logger.info(f"A futás befejeződött. Teljes idő: {end_time - start_time:.2f} másodperc.")
+    logger.info(f"Feldolgozás előtti teljes sorszám: {initial_total_lines:,}")
+
+    if config.get('deleteduplicates', False):
+        final_total_lines = get_total_line_count(files, logger)
+        deleted_lines = initial_total_lines - final_total_lines
+        logger.info(f"Feldolgozás utáni teljes sorszám: {final_total_lines:,}")
+        logger.info(f"Összesen törölt sorok száma: {deleted_lines:,}")
+    
+    logger.info("=" * 50)
+    # --- VÉGE: Végső statisztikák kiírása ---
+
 
 # A szkript belépési pontja, ha közvetlenül futtatják
 if __name__ == '__main__':
